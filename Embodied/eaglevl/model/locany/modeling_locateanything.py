@@ -77,6 +77,10 @@ class LocateAnythingPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif hasattr(module, 'rebuild_buffers'):
+            # The language model's rotary embeddings: non-persistent buffers,
+            # see Qwen2RotaryEmbedding.rebuild_buffers.
+            module.rebuild_buffers()
 
 IGNORE_INDEX = -100
 class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, GenerationMixin):
@@ -140,6 +144,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self._no_split_modules = ["Qwen3DecoderLayer"]
         else:
             self._no_split_modules = ["Qwen2DecoderLayer"]
+
+        # transformers 5's from_pretrained needs what post_init() collects from
+        # the submodules (e.g. all_tied_weights_keys). Only on 5.x, so 4.x
+        # behaviour is unchanged.
+        if hasattr(self, 'get_expanded_tied_weights_keys'):
+            self.post_init()
 
         
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):

@@ -71,10 +71,11 @@ class LocateAnythingPreTrainedModel(PreTrainedModel):
             return config
         return super()._autoset_attn_implementation(config, *args, **kwargs)
 
-    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
+    def _check_and_adjust_attn_implementation(self, attn_implementation, *args, **kwargs):
         if attn_implementation == "magi":
             return "magi"
-        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
+        return super()._check_and_adjust_attn_implementation(
+            attn_implementation, *args, **kwargs)
     
     def _init_weights(self, module):
         std = getattr(self.config, 'initializer_range', None) or self.config.text_config.initializer_range
@@ -86,6 +87,10 @@ class LocateAnythingPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif hasattr(module, 'rebuild_buffers'):
+            # The language model's rotary embeddings: non-persistent buffers,
+            # see Qwen2RotaryEmbedding.rebuild_buffers.
+            module.rebuild_buffers()
 
 
 class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, GenerationMixin):
@@ -157,6 +162,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self._no_split_modules = ["Qwen3DecoderLayer"]
         else:
             self._no_split_modules = ["Qwen2DecoderLayer"]
+
+        # transformers 5's from_pretrained needs what post_init() collects from
+        # the submodules (e.g. all_tied_weights_keys). Only on 5.x, so 4.x
+        # behaviour is unchanged.
+        if hasattr(self, 'get_expanded_tied_weights_keys'):
+            self.post_init()
 
         
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):

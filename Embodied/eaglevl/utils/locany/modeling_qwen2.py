@@ -129,6 +129,24 @@ class Qwen2RotaryEmbedding(nn.Module):
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
         )
 
+    def rebuild_buffers(self, device=None, dtype=None):
+        """Recompute inv_freq and the cos/sin cache.
+
+        These buffers are persistent=False, so the checkpoint does not restore
+        them. transformers 5 builds the model on the meta device and then
+        materialises such buffers without initialising them, which leaves
+        garbage here (non-finite cos/sin, NaN attention). _init_weights calls
+        this so they are recomputed.
+        """
+        device = device if device is not None else self.inv_freq.device
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Keep the dtype the cache was created with (the model's dtype): it is
+        # one cache per layer, so fp32 would cost an extra ~0.6 GB here.
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings, device=device,
+            dtype=dtype if dtype is not None else self.cos_cached.dtype)
+
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
@@ -239,7 +257,14 @@ class Qwen2Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        # transformers 5 moved rope_theta into config.rope_parameters. The text
+        # config is transformers' own Qwen2Config (see
+        # configuration_locateanything.py), so it follows the installed version.
+        self.rope_theta = getattr(config, 'rope_theta', None)
+        if self.rope_theta is None:
+            self.rope_theta = (getattr(config, 'rope_parameters', None) or {}).get('rope_theta')
+        if self.rope_theta is None:
+            raise ValueError("text config has neither rope_theta nor rope_parameters['rope_theta']")
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
 
@@ -1030,6 +1055,27 @@ QWEN2_START_DOCSTRING = r"""
 """
 
 
+def _cache_to_pairs(cache):
+    """Cache -> ((k, v), ...) per layer, the legacy tuple format.
+
+    transformers 5 removed the tuple format and Cache.to_legacy_cache(). Callers
+    that pass tuples (batch_utils/engine_hybrid.py does) still get tuples back.
+    """
+    if hasattr(cache, "to_legacy_cache"):
+        return cache.to_legacy_cache()
+    return tuple((layer.keys, layer.values) for layer in cache.layers)
+
+
+def _cache_from_pairs(dynamic_cache_cls, pairs):
+    """Inverse of _cache_to_pairs; replaces DynamicCache.from_legacy_cache()."""
+    if hasattr(dynamic_cache_cls, "from_legacy_cache"):
+        return dynamic_cache_cls.from_legacy_cache(pairs)
+    cache = dynamic_cache_cls()
+    for layer_idx, (k, v) in enumerate(pairs):
+        cache.update(k, v, layer_idx)
+    return cache
+
+
 @add_start_docstrings(
     "The bare Qwen2 Model outputting raw hidden-states without any specific head on top.",
     QWEN2_START_DOCSTRING,
@@ -1050,10 +1096,11 @@ class Qwen2PreTrainedModel(PreTrainedModel):
             return config
         return super()._autoset_attn_implementation(config, *args, **kwargs)
 
-    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
+    def _check_and_adjust_attn_implementation(self, attn_implementation, *args, **kwargs):
         if attn_implementation == "magi":
             return "magi"
-        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
+        return super()._check_and_adjust_attn_implementation(
+            attn_implementation, *args, **kwargs)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -1065,6 +1112,9 @@ class Qwen2PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, Qwen2RotaryEmbedding):
+            # Non-persistent buffers; see Qwen2RotaryEmbedding.rebuild_buffers.
+            module.rebuild_buffers()
 
 
 QWEN2_INPUTS_DOCSTRING = r"""
@@ -1243,7 +1293,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 if past_key_values is None:
                     past_key_values = DynamicCache()
                 else:
-                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                    past_key_values = _cache_from_pairs(DynamicCache, past_key_values)
             past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
@@ -1386,7 +1436,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+            next_cache = _cache_to_pairs(next_decoder_cache) if use_legacy_cache else next_decoder_cache
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -1399,7 +1449,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
 
 class Qwen2ForCausalLM(Qwen2PreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    # transformers 5 declares ties as {tied: source}; 4.x as a list of tied names.
+    if hasattr(PreTrainedModel, "get_expanded_tied_weights_keys"):
+        _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    else:
+        _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1559,8 +1613,15 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                # transformers 5 removed seen_tokens (an alias of get_seq_length())
+                # and renamed get_max_length() to get_max_cache_shape().
+                past_length = getattr(past_key_values, "seen_tokens", None)
+                if past_length is None:
+                    past_length = cache_length
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                else:
+                    max_cache_length = past_key_values.get_max_cache_shape()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
