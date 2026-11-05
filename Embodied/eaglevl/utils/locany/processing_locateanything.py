@@ -49,7 +49,10 @@ from transformers.utils import logging
 import lmdb
 import cv2
 import pickle
-import decord
+try:
+    import decord
+except ImportError:  # optional; only needed to read video files
+    decord = None
 
 logger = logging.get_logger(__name__)
 
@@ -216,8 +219,13 @@ def _read_video_torchvision(
 
 
 def is_decord_available() -> bool:
+    return decord is not None
+
+
+def is_torchvision_video_available() -> bool:
+    # io.read_video needs PyAV, and torchvision 0.26 removed it altogether.
     import importlib.util
-    return importlib.util.find_spec("decord") is not None
+    return hasattr(io, "read_video") and importlib.util.find_spec("av") is not None
 
 def _read_video_decord(
     ele: dict,
@@ -248,26 +256,41 @@ VIDEO_READER_BACKENDS = {
 }
 
 
+VIDEO_READER_AVAILABLE = {
+    "decord": is_decord_available,
+    "torchvision": is_torchvision_video_available,
+}
+
+
 @lru_cache(maxsize=1)
 def get_video_reader_backend() -> str:
-    if is_decord_available():
-        video_reader_backend = "decord"
-    else:
-        video_reader_backend = "torchvision"
-    return video_reader_backend
+    """decord if installed, otherwise torchvision if it can still read video."""
+    for backend in ("decord", "torchvision"):
+        if VIDEO_READER_AVAILABLE[backend]():
+            return backend
+    raise ImportError(
+        "Cannot read video files: install decord (torchvision's io.read_video "
+        f"needs PyAV and was removed in 0.26; this is {torchvision.__version__})."
+    )
 
 
-def fetch_video(ele: dict, return_video_sample_fps: bool = False, video_reader_backend: str = "torchvision") -> torch.Tensor | list[Image.Image]:
+def fetch_video(ele: dict, return_video_sample_fps: bool = False, video_reader_backend: Optional[str] = None) -> torch.Tensor | list[Image.Image]:
     """
     Fetches video, samples frames, resizes based on video_total_pixels, and returns as Tensor (TCHW).
     """
     if isinstance(ele["video"], str):
-        video_reader_backend = video_reader_backend if video_reader_backend is not None else get_video_reader_backend()
+        video_reader_backend = video_reader_backend or get_video_reader_backend()
         try:
             video, sample_fps, timestamps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
         except Exception as e:
-            logger.warning(f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
-            video, sample_fps, timestamps = VIDEO_READER_BACKENDS["torchvision"](ele)
+            fallback = next(
+                (b for b, ok in VIDEO_READER_AVAILABLE.items() if b != video_reader_backend and ok()),
+                None,
+            )
+            if fallback is None:
+                raise
+            logger.warning(f"video_reader_backend {video_reader_backend} error, falling back to {fallback}, msg: {e}")
+            video, sample_fps, timestamps = VIDEO_READER_BACKENDS[fallback](ele)
 
         nframes, _, height, width = video.shape
         
@@ -562,7 +585,7 @@ class LocateAnythingProcessor(ProcessorMixin):
         self,
         conversations: list[dict] | list[list[dict]],
         return_video_kwargs: bool = False,
-        video_reader_backend: str = "torchvision",
+        video_reader_backend: Optional[str] = None,
     ) -> tuple[list[Image.Image] | None, list[torch.Tensor | list[Image.Image]] | None, Optional[dict]]:
 
         vision_infos = self.extract_vision_info(conversations)
