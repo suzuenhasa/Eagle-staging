@@ -360,6 +360,19 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         use_mtp = generation_mode in ('fast', 'hybrid')
         switch_to_ar_count = 0
 
+        # Hybrid mode treats the text MTP predicts as drafts. MTP's parallel
+        # guesses are sound for boxes, whose fixed structure makes a wrong guess
+        # detectable (error_box), but a wrong guess in prose is simply emitted.
+        # The next forward feeds the drafts back as ordinary causal tokens, so
+        # its logits at those positions are exactly what AR decoding samples
+        # from: a draft is kept only while the AR sample there agrees, and the
+        # first disagreement is replaced by that sample. Text is therefore
+        # sampled as in 'slow' mode, with fewer forwards.
+        n_drafts = 0
+        drafted_count = accepted_count = 0
+        ref_end_token_id = self.token_ids['ref_end_token_id']
+        im_end_token_id = self.token_ids['im_end_token_id']
+
         # Pre-allocate mask tokens and position ids
         default_mask_token_id = self.token_ids['default_mask_token_id']
         pre_mask_tokens = torch.full(
@@ -447,19 +460,31 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             im_end_token_id = self.token_ids['im_end_token_id']
 
             if generation_mode == 'hybrid':
-                # Hybrid AR phase: detect box boundaries to switch back to MTP
-                if token_val == box_end_token_id:
+                # Hybrid AR phase (after a malformed box): hand back to MTP at
+                # the end of the box, or at the end of text if the model moved on
+                # to the next region. Only im_end ends generation.
+                if token_val == im_end_token_id:
+                    out_type = 'im_end'
+                elif token_val in (box_end_token_id, ref_end_token_id):
                     out_type = 'box_end_ar'
                 elif coord_start_token_id <= token_val <= coord_end_token_id or token_val == none_token_id:
                     out_type = 'coord_ar'
-                else:
-                    out_type = 'im_end'
             else:
                 # Slow mode: pure AR, only stop on im_end
                 if token_val == im_end_token_id:
                     out_type = 'im_end'
 
             return out_type, out_token
+
+
+        def _ar_sample(generated, outputs, prepare_inputs, pos):
+            """The AR sample for the token after absolute position `pos`."""
+            n_real = prepare_inputs['input_ids'].size(1) - (n_future_tokens if use_mtp else 0)
+            row = pos - (generated.size(1) - n_real)
+            _, _, x0, _ = sample_tokens(
+                outputs.logits[:, row:row + 1, :], generated[:, :pos + 1], self.token_ids, **generate_kwargs
+            )
+            return x0[0, 0]
 
 
         # Generate loop
@@ -482,6 +507,31 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             with torch.no_grad():
                 outputs = self.language_model(**prepare_inputs)
 
+            # Step 2b (hybrid): verify the text drafted in the previous step.
+            if n_drafts:
+                seq = generated.size(1)
+                n_keep, correction = seq, None
+                for pos in range(seq - n_drafts, seq - 1):
+                    token = _ar_sample(generated, outputs, prepare_inputs, pos)
+                    if token != generated[0, pos + 1]:
+                        n_keep, correction = pos + 1, token
+                        break
+                    accepted_count += 1
+                n_drafts = 0
+                if correction is not None:
+                    generated = torch.cat([generated[:, :n_keep], correction.view(1, 1)], dim=1)
+                    past_key_values = tuple(
+                        (kv[0][:, :, :n_keep, :], kv[1][:, :, :n_keep, :])
+                        for kv in outputs.past_key_values
+                    )
+                    if verbose:
+                        sampling_history.append(('ar', tokenizer.decode(correction.view(1), skip_special_tokens=False)))
+                    if correction.item() == im_end_token_id:
+                        break
+                    continue
+                if generated[0, -1].item() == im_end_token_id:
+                    break
+
             past_key_values = tuple(
                 (kv[0][:, :, :generated.shape[1], :], kv[1][:, :, :generated.shape[1], :])
                 for kv in outputs.past_key_values
@@ -490,6 +540,18 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             # Step 3: Sample tokens
             if use_mtp:
                 out_type, out_token = _sample_token_in_mtp(generated, outputs)
+                if generation_mode == 'hybrid' and out_type == 'ref_object':
+                    # Text: the first token is the AR sample itself; the rest are
+                    # drafts, cut at the end of the text (the box is MTP's job).
+                    first = _ar_sample(generated, outputs, prepare_inputs, generated.size(1) - 1)
+                    if out_token[0] != first:
+                        out_token = first.view(1)
+                    else:
+                        ends = [i for i, t in enumerate(out_token.tolist()) if t in (ref_end_token_id, im_end_token_id)]
+                        if ends:
+                            out_token = out_token[:ends[0] + 1]
+                        n_drafts = out_token.numel()
+                        drafted_count += n_drafts - 1
             else:
                 out_type, out_token = _sample_token_in_ar(generated, outputs)
 
@@ -531,7 +593,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     f"num_boxes={num_boxes}; " + \
                     f"bps={(num_boxes / total_time):.4f}; " + \
                     f"prefill_time={(prefill_time):.4f}; " + \
-                    f"switch_to_ar={switch_to_ar_count}\n"
+                    f"switch_to_ar={switch_to_ar_count}; " + \
+                    f"text_drafts_accepted={accepted_count}/{drafted_count}\n"
             print(out_info)
 
             return response[0], sampling_history, out_info
