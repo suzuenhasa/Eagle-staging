@@ -116,24 +116,49 @@ def sdpa_attention(
     """SDPA attention.
 
     Args:
-        q, k, v: tensor of shape (batch_size, seqlen, num_heads, head_dim),
-            or (tot_seqlens, num_heads, head_dim) if packing.
+        q, k, v: tensor of shape (tot_seqlens, num_heads, head_dim), the packed
+            patches of every image.
+        q_cu_seqlens (torch.Tensor): cumulative sequence lengths, i.e. where each
+            image starts and ends. Each image attends only to itself.
+        k_cu_seqlens (torch.Tensor): unused; this is self-attention, so k and v
+            are delimited by q_cu_seqlens.
     """
-    seq_length = q.shape[0]
-    attention_mask = torch.zeros(
-        [1, seq_length, seq_length], device=q.device, dtype=torch.bool
-    )
-    for i in range(1, len(q_cu_seqlens)):
-        attention_mask[
-            ...,
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-        ] = True
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
-    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-    attn_output = attn_output.transpose(0, 1)
+    seq_length, num_heads, head_dim = q.shape
+    if q_cu_seqlens is None or len(q_cu_seqlens) <= 2:
+        seqlens = [seq_length]
+    else:
+        seqlens = (q_cu_seqlens[1:] - q_cu_seqlens[:-1]).tolist()
+
+    # Attend image by image instead of through a (seq, seq) block-diagonal mask,
+    # and hand SDPA 4-D (batch, heads, seq, head_dim) tensors. Every fused SDPA
+    # kernel requires 4-D inputs, and the flash kernel also requires no mask;
+    # otherwise SDPA falls back to its math kernel, which materialises the full
+    # (heads, seq, seq) score matrix.
+    if len(set(seqlens)) == 1:
+        # One image, or images of equal size such as video frames: one call.
+        n, length = len(seqlens), seqlens[0]
+        q, k, v = (
+            x.reshape(n, length, num_heads, head_dim).transpose(1, 2)
+            for x in (q, k, v)
+        )
+        attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        attn_output = attn_output.transpose(1, 2)
+    else:
+        attn_output = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    qi.transpose(0, 1).unsqueeze(0),
+                    ki.transpose(0, 1).unsqueeze(0),
+                    vi.transpose(0, 1).unsqueeze(0),
+                    dropout_p=0.0,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for qi, ki, vi in zip(
+                    q.split(seqlens), k.split(seqlens), v.split(seqlens)
+                )
+            ]
+        )
     attn_output = attn_output.reshape(seq_length, -1)
     return attn_output
 
@@ -160,7 +185,9 @@ def eager_attention(
     v = v.transpose(0, 1)
 
     attn_weight = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-    attn_weight += attention_mask
+    # The mask is boolean. Adding it would add 1 inside each image's block and 0
+    # outside, which masks nothing; scores across images must be excluded.
+    attn_weight = attn_weight.masked_fill(~attention_mask, float("-inf"))
     attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(q.dtype)
 
     attn_output = attn_weight @ v
